@@ -1,0 +1,202 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Parameters:
+
+  KeyName:
+    Type: "AWS::EC2::KeyPair::KeyName"
+    Description: "The name of the existing EC2 KeyPair to enable SSH access to the instance."
+    ConstraintDescription: "Must be the name of an existing EC2 KeyPair."
+
+  ImageId:
+    Type: String
+    Default: "ami-06b21ccaeff8cd686" # Amazon Linux 2 AMI ID for us-east-1
+    Description: "AMI ID for the EC2 instances (Amazon Linux 2)"
+
+  InstanceType:
+    Type: String
+    Default: "t2.micro"
+    Description: "EC2 instance type"
+
+Resources:
+  # VPC
+  VPC:
+    Type: "AWS::EC2::VPC"
+    Properties:
+      CidrBlock: "10.0.0.0/16"
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: "Name"
+          Value: "MyVPC"
+
+  # Internet Gateway
+  InternetGateway:
+    Type: "AWS::EC2::InternetGateway"
+
+  # Attach Internet Gateway to VPC
+  AttachGateway:
+    Type: "AWS::EC2::VPCGatewayAttachment"
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  # Public Route Table
+  PublicRouteTable:
+    Type: "AWS::EC2::RouteTable"
+    Properties:
+      VpcId: !Ref VPC
+
+  # Public Route
+  PublicRoute:
+    Type: "AWS::EC2::Route"
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: "0.0.0.0/0"
+      GatewayId: !Ref InternetGateway
+
+  # Public Subnet A
+  PublicSubnetA:
+    Type: "AWS::EC2::Subnet"
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: "10.0.1.0/24"
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+
+  # Public Subnet B
+  PublicSubnetB:
+    Type: "AWS::EC2::Subnet"
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: "10.0.2.0/24"
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+
+  # Associate Public Subnets with Public Route Table
+  PublicSubnetARouteTableAssociation:
+    Type: "AWS::EC2::SubnetRouteTableAssociation"
+    Properties:
+      SubnetId: !Ref PublicSubnetA
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnetBRouteTableAssociation:
+    Type: "AWS::EC2::SubnetRouteTableAssociation"
+    Properties:
+      SubnetId: !Ref PublicSubnetB
+      RouteTableId: !Ref PublicRouteTable
+
+  # Private Subnet A
+  PrivateSubnetA:
+    Type: "AWS::EC2::Subnet"
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: "10.0.3.0/24"
+      AvailabilityZone: !Select [0, !GetAZs ""]
+
+  # Private Subnet B
+  PrivateSubnetB:
+    Type: "AWS::EC2::Subnet"
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: "10.0.4.0/24"
+      AvailabilityZone: !Select [1, !GetAZs ""]
+
+  # Security Group for EFS
+  EFSSecurityGroup:
+    Type: "AWS::EC2::SecurityGroup"
+    Properties:
+      GroupDescription: "Allow NFS access to EFS"
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: "tcp"
+          FromPort: 2049
+          ToPort: 2049
+          CidrIp: "10.0.0.0/16"
+
+  # Security Group for EC2 Instance
+  EC2SecurityGroup:
+    Type: "AWS::EC2::SecurityGroup"
+    Properties:
+      GroupDescription: "Allow SSH access and EFS"
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: "tcp"
+          FromPort: 22
+          ToPort: 22
+          CidrIp: "0.0.0.0/0"  # Adjust as needed for security
+        - IpProtocol: "tcp"
+          FromPort: 2049
+          ToPort: 2049
+          SourceSecurityGroupId: !Ref EFSSecurityGroup
+
+  # EFS File System
+  EFSFileSystem:
+    Type: "AWS::EFS::FileSystem"
+    Properties:
+      Encrypted: true
+
+  # EFS Mount Targets
+  EFSMountTargetA:
+    Type: "AWS::EFS::MountTarget"
+    Properties:
+      FileSystemId: !Ref EFSFileSystem
+      SubnetId: !Ref PrivateSubnetA
+      SecurityGroups: [!Ref EFSSecurityGroup]
+
+  # IAM Role for EC2 Instance to Access S3
+  EC2Role:
+    Type: "AWS::IAM::Role"
+    Properties:
+      RoleName: "aws-ec2-access-s3-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service: "ec2.amazonaws.com"
+            Action: "sts:AssumeRole"
+      Policies:
+        - PolicyName: "S3AccessPolicy"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action:
+                  - "s3:ListAllMyBuckets"
+                  - "s3:GetObject"
+                  - "s3:PutObject"
+                Resource: "*"
+
+  # IAM Instance Profile
+  EC2InstanceProfile:
+    Type: "AWS::IAM::InstanceProfile"
+    Properties:
+      Roles: [!Ref EC2Role]
+
+  # EC2 Instance
+  EC2Instance:
+    Type: "AWS::EC2::Instance"
+    Properties:
+      InstanceType: !Ref InstanceType
+      ImageId: !Ref ImageId
+      SecurityGroupIds: [!Ref EC2SecurityGroup]
+      SubnetId: !Ref PublicSubnetA
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      KeyName: !Ref KeyName
+      UserData:
+        Fn::Base64: |
+          #!/bin/bash
+          yum install -y amazon-efs-utils
+          mkdir -p /home/ec2-user/my-efs-mount
+          # Check if EFS is ready and then mount
+          retry_count=0
+          max_retries=5
+          while [ $retry_count -lt $max_retries ]; do
+            if mount -t efs ${EFSFileSystem} /home/ec2-user/my-efs-mount; then
+              echo "EFS mounted successfully"
+              break
+            else
+              echo "EFS not ready, retrying..."
+              sleep 10
+              retry_count=$((retry_count + 1))
+            fi
+          done
